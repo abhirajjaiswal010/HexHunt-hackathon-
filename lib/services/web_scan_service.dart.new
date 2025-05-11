@@ -1,0 +1,397 @@
+import 'dart:io';
+import 'dart:async';
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as path;
+import 'dart:convert';
+import '../models/scan_result.dart';
+import '../models/threat.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'dart:math' as math;
+import '../models/scan_report.dart';
+import '../screens/scan_report_screen.dart';
+import 'database_service.dart';
+import '../screens/enhanced_scan_report_popup.dart';
+import 'url_validator_service.dart';
+
+class WebScanException implements Exception {
+  final String message;
+  WebScanException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class WebScanResult extends ScanReport {
+  final String url;
+  final List<Map<String, dynamic>> findings;
+  final List<Threat> threats;
+  final int riskScore;
+  final String summary;
+  final Map<String, dynamic> scanMetadata;
+
+  WebScanResult({
+    required this.url,
+    required this.findings,
+    required this.threats,
+    required this.riskScore,
+    required this.summary,
+    required this.scanMetadata,
+  }) : super(
+          target: url,
+          timestamp: DateTime.now(),
+          scanType: 'web',
+          vulnerabilityDistribution: _calculateVulnerabilityDistribution(threats),
+          findings: findings,
+          threats: threats,
+          riskScore: riskScore,
+          summary: summary,
+          recommendations: [],
+          scanMetadata: scanMetadata,
+          openPorts: [],
+          scanDuration: 0,
+        );
+
+  static Map<String, int> _calculateVulnerabilityDistribution(List<Threat> threats) {
+    final distribution = <String, int>{
+      'Critical': 0,
+      'High': 0,
+      'Medium': 0,
+      'Low': 0,
+      'Info': 0,
+    };
+
+    for (final threat in threats) {
+      distribution[threat.severity] = (distribution[threat.severity] ?? 0) + 1;
+    }
+
+    return distribution;
+  }
+}
+
+class WebScanService {
+  static final WebScanService _instance = WebScanService._internal();
+  factory WebScanService() => _instance;
+  WebScanService._internal();
+
+  final DatabaseService _db = DatabaseService();
+  final http.Client _client = http.Client();
+  final URLValidatorService _urlValidator = URLValidatorService();
+  String _currentTarget = '';
+  final List<Map<String, dynamic>> _findings = [];
+
+  Future<void> startScan(String target, BuildContext context) async {
+    _currentTarget = target;
+    _findings.clear();
+
+    try {
+      final validationResult = await _urlValidator.validateURL(target);
+      if (!validationResult.isValid) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('URL validation failed: ${validationResult.error}'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        return;
+      }
+
+      final result = await scanUrl(validationResult.url!);
+      if (context.mounted) {
+        await showDialog(
+          context: context,
+          builder: (context) => EnhancedScanReportPopup(
+            report: result,
+            onClose: () => Navigator.of(context).pop(),
+          ),
+        );
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error during scan: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<ScanReport> scanUrl(String url) async {
+    try {
+      final findings = <Map<String, dynamic>>[];
+      
+      // Initial connection and header analysis
+      final response = await http.get(Uri.parse(url));
+      
+      // Analyze headers
+      final headerFindings = await _analyzeHeaders(response.headers);
+      findings.addAll(headerFindings);
+
+      final threats = _convertFindingsToThreats(findings);
+      final vulnDist = _calculateVulnerabilityDistribution();
+      final riskScore = _calculateRiskScore();
+      final summary = _generateSummary();
+
+      return ScanReport(
+        timestamp: DateTime.now(),
+        target: url,
+        scanType: 'web',
+        findings: findings,
+        vulnerabilityDistribution: vulnDist,
+        threats: threats,
+        riskScore: riskScore,
+        summary: summary,
+        scanMetadata: {
+          'scan_duration': 12,
+          'protocol': response.request?.url.scheme ?? 'https',
+          'server': response.headers['server'] ?? 'Unknown',
+          'headers': response.headers.entries.map((e) => '${e.key}: ${e.value}').toList(),
+        },
+        openPorts: [],
+        scanDuration: 12,
+      );
+    } catch (e) {
+      throw Exception('Failed to scan URL: $e');
+    }
+  }
+
+  List<Map<String, dynamic>> _analyzeHeaders(Map<String, String> headers) {
+    final findings = <Map<String, dynamic>>[];
+
+    // Check security headers
+    _checkSecurityHeader(findings, headers, 'Content-Security-Policy',
+        'Critical security header missing', 'High');
+    _checkSecurityHeader(findings, headers, 'X-Content-Type-Options',
+        'Security header missing', 'Medium');
+    _checkSecurityHeader(findings, headers, 'X-Frame-Options',
+        'Clickjacking protection missing', 'Medium');
+    _checkSecurityHeader(findings, headers, 'Strict-Transport-Security',
+        'HSTS not enabled', 'High');
+    _checkSecurityHeader(findings, headers, 'X-XSS-Protection',
+        'XSS protection missing', 'Medium');
+
+    return findings;
+  }
+
+  void _checkSecurityHeader(
+      List<Map<String, dynamic>> findings,
+      Map<String, String> headers,
+      String header,
+      String issue,
+      String severity) {
+    if (!headers.containsKey(header.toLowerCase())) {
+      findings.add({
+        'type': 'Missing Security Header',
+        'severity': severity,
+        'description': issue,
+        'location': 'HTTP Headers',
+        'details': {
+          'header': header,
+          'impact': _getHeaderImpact(header),
+          'current_state': 'Not implemented',
+        },
+        'recommendation': _getHeaderRecommendation(header),
+      });
+    }
+  }
+
+  String _getHeaderImpact(String header) {
+    switch (header) {
+      case 'Content-Security-Policy':
+        return 'Vulnerable to XSS and other injection attacks';
+      case 'X-Content-Type-Options':
+        return 'Potential MIME type sniffing attacks';
+      case 'X-Frame-Options':
+        return 'Vulnerable to clickjacking attacks';
+      case 'Strict-Transport-Security':
+        return 'Possible downgrade attacks and insecure connections';
+      default:
+        return 'Security posture weakened';
+    }
+  }
+
+  String _getHeaderRecommendation(String header) {
+    switch (header) {
+      case 'Content-Security-Policy':
+        return 'Implement a strict Content Security Policy to prevent XSS attacks';
+      case 'X-Content-Type-Options':
+        return 'Add X-Content-Type-Options: nosniff to prevent MIME type sniffing';
+      case 'X-Frame-Options':
+        return 'Set X-Frame-Options to DENY or SAMEORIGIN to prevent clickjacking';
+      case 'Strict-Transport-Security':
+        return 'Enable HSTS with a long max-age to enforce HTTPS connections';
+      default:
+        return 'Add the ${header} header with appropriate values';
+    }
+  }
+
+  List<Threat> _convertFindingsToThreats(List<Map<String, dynamic>> findings) {
+    return findings
+        .map((finding) => Threat(
+              name: finding['name'] ?? finding['type'] ?? 'Unknown Issue',
+              severity: finding['severity'] as String,
+              location: finding['location'] as String,
+              description: finding['description'] as String,
+              recommendation: finding['recommendation'] as String,
+              detectedAt: DateTime.now(),
+              type: finding['type'] as String,
+            ))
+        .toList();
+  }
+
+  Map<String, int> _calculateVulnerabilityDistribution() {
+    return {
+      'Critical': _findings.where((f) => f['severity'] == 'Critical').length,
+      'High': _findings.where((f) => f['severity'] == 'High').length,
+      'Medium': _findings.where((f) => f['severity'] == 'Medium').length,
+      'Low': _findings.where((f) => f['severity'] == 'Low').length,
+    };
+  }
+
+  int _calculateRiskScore() {
+    int score = 0;
+    final weights = {
+      'Critical': 25,
+      'High': 15,
+      'Medium': 8,
+      'Low': 3,
+    };
+
+    for (final finding in _findings) {
+      final severity = finding['severity'] as String;
+      final weight = weights[severity] ?? 0;
+      score += weight;
+    }
+
+    return score.clamp(0, 100);
+  }
+
+  String _generateSummary() {
+    final totalVulnerabilities = _findings.length;
+    if (totalVulnerabilities == 0) {
+      return 'No vulnerabilities were found in the scan.';
+    }
+
+    final buffer = StringBuffer();
+    buffer.write('Found $totalVulnerabilities vulnerabilities: ');
+
+    final criticalCount = _findings.where((f) => f['severity'] == 'Critical').length;
+    final highCount = _findings.where((f) => f['severity'] == 'High').length;
+    final mediumCount = _findings.where((f) => f['severity'] == 'Medium').length;
+    final lowCount = _findings.where((f) => f['severity'] == 'Low').length;
+
+    if (criticalCount > 0) buffer.write('$criticalCount critical, ');
+    if (highCount > 0) buffer.write('$highCount high risk, ');
+    if (mediumCount > 0) buffer.write('$mediumCount medium risk, ');
+    if (lowCount > 0) buffer.write('$lowCount low risk. ');
+
+    if (criticalCount > 0 || highCount > 0) {
+      buffer.write('Immediate attention required.');
+    } else if (mediumCount > 0) {
+      buffer.write('Address medium risk issues soon.');
+    } else {
+      buffer.write('Low risk issues can be addressed as time permits.');
+    }
+
+    return buffer.toString();
+  }
+}
+
+Future<List<String>> enumerateSubdomains(String domain) async {
+  try {
+    final response = await http
+        .get(Uri.parse('https://api.sublist3r.com/search.php?domain=$domain'));
+    if (response.statusCode == 200) {
+      final List<dynamic> data = jsonDecode(response.body);
+      return List<String>.from(data);
+    }
+  } catch (e) {
+    print('Subdomain enumeration error: $e');
+  }
+  return [];
+}
+
+Future<Map<String, dynamic>> fetchThreatIntel(
+    String ipOrDomain, String apiKey) async {
+  try {
+    final response = await http.get(
+      Uri.parse('https://www.virustotal.com/api/v3/ip_addresses/$ipOrDomain'),
+      headers: {'x-apikey': apiKey},
+    );
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      return {
+        'Reputation': data['data']['attributes']['reputation'].toString(),
+        'Harmless': data['data']['attributes']['last_analysis_stats']
+                ['harmless']
+            .toString(),
+        'Malicious': data['data']['attributes']['last_analysis_stats']
+                ['malicious']
+            .toString(),
+        'Suspicious': data['data']['attributes']['last_analysis_stats']
+                ['suspicious']
+            .toString(),
+      };
+    }
+  } catch (e) {
+    print('Threat intelligence error: $e');
+  }
+  return {};
+}
+
+Future<Map<String, dynamic>> analyzeWithAI(
+    Map<String, dynamic> scanResults) async {
+  final findings = scanResults['findings'] as List<dynamic>? ?? [];
+  final openPorts = scanResults['openPorts'] as List<dynamic>? ?? [];
+  final threatIntel =
+      scanResults['threatIntelligence'] as Map<String, dynamic>? ?? {};
+
+  int score = 0;
+
+  // Add points for each finding by severity
+  for (var finding in findings) {
+    switch ((finding['severity'] ?? '').toLowerCase()) {
+      case 'critical':
+        score += 30;
+        break;
+      case 'high':
+        score += 20;
+        break;
+      case 'medium':
+        score += 10;
+        break;
+      case 'low':
+        score += 5;
+        break;
+    }
+  }
+
+  // Add points for open ports
+  score += openPorts.length * 3;
+
+  // Add points for threat intelligence
+  if (threatIntel['Malicious'] != null) {
+    score += int.tryParse(threatIntel['Malicious'].toString()) ?? 0;
+  }
+  if (threatIntel['Suspicious'] != null) {
+    score += int.tryParse(threatIntel['Suspicious'].toString()) ?? 0;
+  }
+
+  // Cap score at 100
+  score = score.clamp(0, 100);
+
+  // Trend and confidence (simple logic)
+  String trend = score > 70 ? 'Rising' : (score > 40 ? 'Stable' : 'Low');
+  String confidence =
+      findings.length > 5 ? 'High' : (findings.length > 2 ? 'Medium' : 'Low');
+
+  return {
+    'AI Risk Score': score,
+    'Trend': trend,
+    'Confidence': confidence,
+  };
+} 
